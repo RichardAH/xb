@@ -51,6 +51,9 @@ Top:      xrpld (main) -> all above
 
 ## Usage
   cd /root/xahaud
+  
   python3 -m xb build --type Release --jobs 18
+  
   python3 -m xb clean
+  
   python3 -m xb info
