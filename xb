@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""
+xb – Xahau Build System
+
+Usage:
+    ./xb build [--jobs N] [--type Release|Debug] [--clean]
+    ./xb info
+    ./xb clean
+"""
+
+import sys
+import os
+
+# Ensure we can import xb package from this directory
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+sys.path.insert(0, project_root)
+
+from xb.build import main
+
+sys.exit(main() or 0)
