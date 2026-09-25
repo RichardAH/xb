@@ -113,6 +113,11 @@ _PKG_LAYOUTS = [
         "lib": "lib",
         "libs": ["sqlite3"],
     }),
+    ("wasme", {  # matches wasmedge (conan truncates to wasme...)
+        "include": "include",
+        "lib": "lib",
+        "libs": ["wasmedge"],
+    }),
 ]
 
 

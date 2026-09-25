@@ -121,63 +121,6 @@ def _os_version() -> tuple[str, int, int] | None:
 
 
 # ---------------------------------------------------------------------------
-# WasmEdge custom install helper
-# ---------------------------------------------------------------------------
-
-def _try_install_wasmedge() -> bool:
-    """
-    Try to install WasmEdge via the official installer script.
-
-    WasmEdge is NOT in Ubuntu's default repos before 24.04, so we need
-    to use the official installer from GitHub.
-
-    Returns True if headers become available after install attempt.
-    """
-    script_url = "https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/tools/installer"
-
-    log.info(f"Downloading WasmEdge installer from {script_url}...")
-    try:
-        subprocess.run(
-            ["wget", "-qO", "/tmp/wasmedge_installer.sh", script_url],
-            capture_output=True, timeout=120,
-        )
-        subprocess.run(
-            ["sudo", "bash", "/tmp/wasmedge_installer.sh", "--version", "latest",
-             "--env", "/etc/profile.d/wasmedge.sh"],
-            timeout=600,
-        )
-        # Cleanup
-        try:
-            os.remove("/tmp/wasmedge_installer.sh")
-        except OSError:
-            pass
-    except Exception as e:
-        log.error(f"WasmEdge installer failed: {e}")
-        return False
-
-    log.info("WasmEdge installer completed – sourcing environment...")
-
-    # Source the env script so headers/libs are findable
-    env_file = "/etc/profile.d/wasmedge.sh"
-    if os.path.exists(env_file):
-        try:
-            result = subprocess.run(
-                [".", env_file], shell=True, capture_output=True, text=True, timeout=10,
-            )
-            # Also update current process env from the sourced file
-            for line in result.stdout.splitlines():
-                if line.startswith("export "):
-                    parts = line[7:].split("=", 1)
-                    if len(parts) == 2:
-                        os.environ[parts[0]] = parts[1]
-        except Exception:
-            pass
-
-    # Final check
-    return _find_header("wasmedge/wasmedge.h") is not None
-
-
-# ---------------------------------------------------------------------------
 # Built-in dependency definitions
 # ---------------------------------------------------------------------------
 
@@ -222,17 +165,6 @@ def _builtin_deps() -> list[Dep]:
             apt_pkg="ccache",
             check=lambda: _which("ccache") is not None,
             optional=True,
-        ),
-        Dep(
-            name="WasmEdge runtime headers (wasmedge/wasmedge.h)",
-            apt_pkg="wasmedge",
-            check=lambda: _find_header("wasmedge/wasmedge.h") is not None,
-            hint="Required for Hooks support in xahaud. "
-                 "If 'wasmedge' apt package is unavailable, xb will attempt "
-                 "to install from https://github.com/WasmEdge/WasmEdge",
-            install_alternatives=[
-                "sudo bash <(wget -qO- https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/tools/installer) --version latest --env /etc/profile.d/wasmedge.sh",
-            ],
         ),
     ]
 
@@ -298,14 +230,6 @@ def _prompt_install(dep: Dep) -> bool:
                 log.info(f"Trying step {i}/{len(commands_to_try)}...")
             ok = _run_install(cmd)
             if ok:
-                # Source env if wasmedge was installed via alternative method
-                if i > 1 and dep.apt_pkg == "wasmedge":
-                    env_file = "/etc/profile.d/wasmedge.sh"
-                    if os.path.exists(env_file):
-                        subprocess.run(
-                            [".", env_file], shell=True,
-                            capture_output=True, timeout=10,
-                        )
                 # Re-check
                 try:
                     if dep.check():
