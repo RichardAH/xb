@@ -9,16 +9,14 @@ Dependencies are defined in two places:
   2. Project-level library requirements passed via xbp.py or build.py
 
 Usage:
-    from xb.sysdeps import SysDeps, check_all_deps
+    from xb.sysdeps import check_all_deps
 
     # Quick one-liner (interactive, prompts for each missing dep)
     ok = check_all_deps()
 
     # Project-supplied extra deps
     ok = check_all_deps(extra_deps={
-        "libwasmedge-dev": {"pkg": "libwasmedge-dev",
-                           "check": lambda: find_header("wasmedge/wasmedge.h")},
-        "rocksdb": {"pkg": "librocksdb-dev",
+        "rocksdb": {"apt_pkg": "librocksdb-dev",
                     "check": lambda: find_header("rocksdb/db.h")},
     })
 """
@@ -27,7 +25,7 @@ import logging
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 log = logging.getLogger("xb.sysdeps")
@@ -42,10 +40,12 @@ class Dep:
     """A single system dependency to check."""
 
     name: str                    # human-friendly label
-    apt_pkg: str                # apt package name
+    apt_pkg: str                # apt package name (may be empty if not apt-installable)
     check: Callable[[], bool]   # returns True if the dep is present
     hint: str = ""              # extra text shown when missing
     optional: bool = False      # don't block build if missing
+    # Custom install command(s) – called if default apt install fails
+    install_alternatives: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -61,14 +61,12 @@ _HEADER_SEARCH_PATHS = [
 
 
 def _which(cmd: str) -> str | None:
-    """Wrapper around shutil.which that also searches /snap and flatpak paths."""
     return shutil.which(cmd)
 
 
 def _find_header(header: str, extra_paths: list[str] | None = None) -> str | None:
     """Try to locate *header* by asking the compiler."""
-    paths = _HEADER_SEARCH_PATHS + (extra_paths or [])
-    # Quick check: just ask gcc where it would find the file
+    # Quick check: ask gcc where it would find the file
     try:
         result = subprocess.run(
             ["g++", "-print-file-name", header],
@@ -80,6 +78,7 @@ def _find_header(header: str, extra_paths: list[str] | None = None) -> str | Non
         pass
 
     # Fallback: brute-force search
+    paths = _HEADER_SEARCH_PATHS + (extra_paths or [])
     for p in paths:
         candidate = os.path.join(p, header)
         if os.path.isfile(candidate):
@@ -99,25 +98,83 @@ def _pkg_config_ok(pkg: str) -> bool:
         return False
 
 
-def _lib_exists(lib_name: str) -> bool:
-    """Check if a library file (lib<name>.so or .a) exists anywhere ld can find."""
-    for ext in ["so", "a"]:
-        pat = f"lib{lib_name}.{ext}"
+# ---------------------------------------------------------------------------
+# Ubuntu / Debian version detection
+# ---------------------------------------------------------------------------
+
+def _os_version() -> tuple[str, int, int] | None:
+    """Detect OS name and major.minor version, e.g. ('ubuntu', 24, 04)."""
+    try:
+        with open("/etc/os-release") as f:
+            name = ""
+            ver_major = ver_minor = 0
+            for line in f:
+                if line.startswith("ID="):
+                    name = line.split("=")[1].strip().strip('"')
+                elif line.startswith("VERSION_ID="):
+                    parts = line.split("=")[1].strip().strip('"').split(".")
+                    ver_major = int(parts[0]) if parts else 0
+                    ver_minor = int(parts[1]) if len(parts) > 1 else 0
+            return (name, ver_major, ver_minor)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# WasmEdge custom install helper
+# ---------------------------------------------------------------------------
+
+def _try_install_wasmedge() -> bool:
+    """
+    Try to install WasmEdge via the official installer script.
+
+    WasmEdge is NOT in Ubuntu's default repos before 24.04, so we need
+    to use the official installer from GitHub.
+
+    Returns True if headers become available after install attempt.
+    """
+    script_url = "https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/tools/installer"
+
+    log.info(f"Downloading WasmEdge installer from {script_url}...")
+    try:
+        subprocess.run(
+            ["wget", "-qO", "/tmp/wasmedge_installer.sh", script_url],
+            capture_output=True, timeout=120,
+        )
+        subprocess.run(
+            ["sudo", "bash", "/tmp/wasmedge_installer.sh", "--version", "latest",
+             "--env", "/etc/profile.d/wasmedge.sh"],
+            timeout=600,
+        )
+        # Cleanup
+        try:
+            os.remove("/tmp/wasmedge_installer.sh")
+        except OSError:
+            pass
+    except Exception as e:
+        log.error(f"WasmEdge installer failed: {e}")
+        return False
+
+    log.info("WasmEdge installer completed – sourcing environment...")
+
+    # Source the env script so headers/libs are findable
+    env_file = "/etc/profile.d/wasmedge.sh"
+    if os.path.exists(env_file):
         try:
             result = subprocess.run(
-                ["ldconfig", "-p"], capture_output=True, text=True, timeout=10,
+                [".", env_file], shell=True, capture_output=True, text=True, timeout=10,
             )
-            if pat in result.stdout:
-                return True
+            # Also update current process env from the sourced file
+            for line in result.stdout.splitlines():
+                if line.startswith("export "):
+                    parts = line[7:].split("=", 1)
+                    if len(parts) == 2:
+                        os.environ[parts[0]] = parts[1]
         except Exception:
             pass
-        # Also check standard paths
-        for base in ["/usr/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu"]:
-            for ext2 in [ext, f"so.1", f"a"]:
-                candidate = os.path.join(base, f"lib{lib_name}.{ext2}")
-                if os.path.isfile(candidate):
-                    return True
-    return False
+
+    # Final check
+    return _find_header("wasmedge/wasmedge.h") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -127,20 +184,11 @@ def _lib_exists(lib_name: str) -> bool:
 def _builtin_deps() -> list[Dep]:
     """Return the default set of tool dependencies."""
 
-    def _cc_ok():
-        return _which("g++") is not None or _which("clang++") is not None
-
-    def _protoc_ok():
-        return _which("protoc") is not None
-
-    def _pkg_config_ok_func():
-        return _which("pkg-config") is not None
-
     deps = [
         Dep(
             name="C++ compiler (g++ or clang++)",
             apt_pkg="g++",
-            check=_cc_ok,
+            check=lambda: _which("g++") is not None or _which("clang++") is not None,
             hint="Also works: clang++ from package clang",
         ),
         Dep(
@@ -156,13 +204,13 @@ def _builtin_deps() -> list[Dep]:
         Dep(
             name="protoc (Protocol Buffers compiler)",
             apt_pkg="protobuf-compiler",
-            check=_protoc_ok,
+            check=lambda: _which("protoc") is not None,
             hint="Version >= 3.21.0 recommended for xahaud",
         ),
         Dep(
             name="pkg-config",
             apt_pkg="pkg-config",
-            check=_pkg_config_ok_func,
+            check=lambda: _which("pkg-config") is not None,
         ),
         Dep(
             name="git",
@@ -180,8 +228,11 @@ def _builtin_deps() -> list[Dep]:
             apt_pkg="wasmedge",
             check=lambda: _find_header("wasmedge/wasmedge.h") is not None,
             hint="Required for Hooks support in xahaud. "
-                 "If apt package 'wasmedge' is unavailable, "
-                 "install from https://github.com/WasmEdge/WasmEdge/releases",
+                 "If 'wasmedge' apt package is unavailable, xb will attempt "
+                 "to install from https://github.com/WasmEdge/WasmEdge",
+            install_alternatives=[
+                "sudo bash <(wget -qO- https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/tools/installer) --version latest --env /etc/profile.d/wasmedge.sh",
+            ],
         ),
     ]
 
@@ -192,41 +243,86 @@ def _builtin_deps() -> list[Dep]:
 # Interactive install
 # ---------------------------------------------------------------------------
 
-def _prompt_install(apt_pkg: str, dep_name: str, hint: str = "") -> bool:
-    """
-    Ask the user if they want to install *apt_pkg*.
+def _run_install(cmd: str) -> bool:
+    """Run a single install command, return True if it succeeded."""
+    log.info(f"Running: {cmd}")
+    try:
+        result = subprocess.run(
+            cmd, shell=True, timeout=600,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log.error("Install command timed out")
+        return False
+    except Exception as e:
+        log.error(f"Install command failed: {e}")
+        return False
 
-    Returns True if installed successfully, False if user declined or install failed.
+
+def _prompt_install(dep: Dep) -> bool:
     """
-    msg = f"\nMissing: {dep_name}\n"
-    msg += f"  apt package: {apt_pkg}\n"
-    if hint:
-        msg += f"  Note: {hint}\n"
-    msg += f"\n  Install with: sudo apt-get install -y {apt_pkg}\n"
-    msg += f"\n  Install now? [y/N] "
+    Ask the user if they want to install *dep*.
+    Returns True if the dep is now available.
+    """
+    apt_cmd = f"sudo apt-get install -y {dep.apt_pkg}" if dep.apt_pkg else None
+
+    lines = [f"\nMissing: {dep.name}"]
+    if dep.apt_pkg:
+        lines.append(f"  apt package: {dep.apt_pkg}")
+    if dep.hint:
+        lines.append(f"  Note: {dep.hint}")
+
+    # Build list of commands to try
+    commands_to_try: list[str] = []
+    if apt_cmd:
+        commands_to_try.append(apt_cmd)
+    if dep.install_alternatives:
+        for alt in dep.install_alternatives:
+            commands_to_try.append(alt)
+
+    lines.append("")
+    for i, cmd in enumerate(commands_to_try, 1):
+        lines.append(f"  Step {i}: {cmd}")
+
+    lines.append("")
+    lines.append("  Install now? [y/N] ")
 
     try:
-        answer = input(msg).strip().lower()
-        if answer in ("y", "yes"):
-            log.info(f"Installing {apt_pkg}...")
-            result = subprocess.run(
-                ["sudo", "apt-get", "install", "-y", apt_pkg],
-                timeout=300,
-            )
-            if result.returncode == 0:
-                log.info(f"Installed {apt_pkg} successfully")
-                return True
-            else:
-                log.error(f"Failed to install {apt_pkg}")
-                return False
-        else:
-            log.info(f"Skipping install of {apt_pkg}")
+        answer = input("\n".join(lines)).strip().lower()
+        if answer not in ("y", "yes"):
+            log.info(f"Skipping install of {dep.apt_pkg or dep.name}")
             return False
+
+        for i, cmd in enumerate(commands_to_try, 1):
+            if len(commands_to_try) > 1:
+                log.info(f"Trying step {i}/{len(commands_to_try)}...")
+            ok = _run_install(cmd)
+            if ok:
+                # Source env if wasmedge was installed via alternative method
+                if i > 1 and dep.apt_pkg == "wasmedge":
+                    env_file = "/etc/profile.d/wasmedge.sh"
+                    if os.path.exists(env_file):
+                        subprocess.run(
+                            [".", env_file], shell=True,
+                            capture_output=True, timeout=10,
+                        )
+                # Re-check
+                try:
+                    if dep.check():
+                        log.info(f"Installed {dep.name} successfully")
+                        return True
+                except Exception:
+                    pass
+            else:
+                if i < len(commands_to_try):
+                    log.warning(f"Step {i} failed, trying next alternative...")
+                else:
+                    log.error(f"Install of {dep.apt_pkg or dep.name} failed")
+
+        return False
+
     except (KeyboardInterrupt, EOFError):
         log.info("Interrupted")
-        return False
-    except subprocess.TimeoutExpired:
-        log.error(f"Install of {apt_pkg} timed out")
         return False
 
 
@@ -247,15 +343,6 @@ def check_all_deps(
     extra_deps : dict
         Project-supplied dependency overrides. Keys are arbitrary identifiers.
         Values are dicts with "apt_pkg" (str) and "check" (callable).
-        Example::
-
-            {
-                "wasmedge": {"apt_pkg": "libwasmedge-dev",
-                             "check": lambda: _find_header("wasmedge/wasmedge.h")},
-                "rocksdb": {"apt_pkg": "librocksdb-dev",
-                            "check": lambda: _find_header("rocksdb/db.h")},
-            }
-
     auto_install : bool
         If True, prompt the user to install missing dependencies.
     quiet : bool
@@ -273,7 +360,7 @@ def check_all_deps(
         for key, spec in extra_deps.items():
             dep = Dep(
                 name=spec.get("name", key),
-                apt_pkg=spec["apt_pkg"],
+                apt_pkg=spec.get("apt_pkg", ""),
                 check=spec["check"],
                 hint=spec.get("hint", ""),
                 optional=spec.get("optional", False),
@@ -313,17 +400,11 @@ def check_all_deps(
                 log.info(f"  (optional) skipping {dep.name}")
             continue
         if auto_install:
-            ok = _prompt_install(dep.apt_pkg, dep.name, dep.hint)
+            ok = _prompt_install(dep)
             if ok:
-                # Re-check immediately
-                try:
-                    if dep.check():
-                        if not quiet:
-                            log.info(f"  ✓ {dep.name} (now present)")
-                        continue
-                except Exception:
-                    pass
-            # Still missing after install attempt
+                if not quiet:
+                    log.info(f"  ✓ {dep.name} (now present)")
+                continue
             blocked = True
             if not quiet:
                 log.error(f"  ✗ {dep.name} is still not available")
