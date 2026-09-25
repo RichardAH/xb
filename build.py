@@ -24,6 +24,7 @@ from .compiler import dispatch
 from .linker import link
 from .cache import BuildCache
 from .deps import ExternalDeps, generate_protobuf, find_proto_sources
+from .sysdeps import check_all_deps
 
 
 def setup_logging(verbose: bool = False):
@@ -45,6 +46,7 @@ def build_project(
     clean: bool = False,
     conan_build: str | None = None,
     skip_proto: bool = False,
+    skip_deps_check: bool = False,
 ) -> dict:
     """
     Build the complete xahaud project.
@@ -62,6 +64,12 @@ def build_project(
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     os.makedirs(build_dir, exist_ok=True)
+
+    # Check system dependencies before attempting to build
+    if not skip_deps_check:
+        if not check_all_deps():
+            log.error("Missing system dependencies – cannot build")
+            return {"link_ok": False, "error": "missing_deps"}
 
     # Auto-detect conan build directory if not specified
     if conan_build is None:
@@ -372,8 +380,9 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["build", "info", "clean"],
+        choices=["build", "info", "clean", "deps"],
         default="build",
+        help="Command to run",
     )
     parser.add_argument(
         "--jobs", "-j", type=int, default=None,
@@ -412,6 +421,10 @@ def main():
         "--verbose", "-v", action="store_true",
         help="Verbose output",
     )
+    parser.add_argument(
+        "--skip-deps-check", action="store_true",
+        help="Skip system dependency checks (use in CI)",
+    )
 
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -431,6 +444,15 @@ def main():
         log.info(f"Cache stats: {json.dumps(stats, indent=2)}")
         return
 
+    if args.command == "deps":
+        log = logging.getLogger("xb")
+        log.info("Checking system dependencies...")
+        from .sysdeps import check_all_deps
+        ok = check_all_deps(auto_install=True, quiet=False)
+        if not ok:
+            sys.exit(1)
+        return
+
     if args.command == "build":
         result = build_project(
             src_root=args.src_root,
@@ -441,6 +463,7 @@ def main():
             clean=args.clean,
             conan_build=args.conan_build,
             skip_proto=args.skip_proto,
+            skip_deps_check=args.skip_deps_check,
         )
         if result.get("link_ok"):
             sys.exit(0)
