@@ -175,6 +175,14 @@ def _builtin_deps() -> list[Dep]:
             check=lambda: _which("ccache") is not None,
             optional=True,
         ),
+        Dep(
+            name="WasmEdge runtime headers (wasmedge/wasmedge.h)",
+            apt_pkg="wasmedge",
+            check=lambda: _find_header("wasmedge/wasmedge.h") is not None,
+            hint="Required for Hooks support in xahaud. "
+                 "If apt package 'wasmedge' is unavailable, "
+                 "install from https://github.com/WasmEdge/WasmEdge/releases",
+        ),
     ]
 
     return deps
