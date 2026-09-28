@@ -88,11 +88,11 @@ def _compile_one(target: Target, include_dirs: list[str], cache_dir: str,
         proc = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=900,
+            timeout=3600,
         )
         if proc.returncode != 0:
             stderr = proc.stderr.decode(errors="replace")[:2000]
-            log.error(f"FAIL {target.src}: {stderr[:500]}")
+            log.error(f"FAIL {target.src}: {stderr[:5000]}")
             target.status = "failed"
             with _progress_lock:
                 _progress["failed"] += 1
@@ -142,8 +142,8 @@ def dispatch(
     if total == 0:
         return {"compiled": 0, "skipped": 0, "failed": 0, "elapsed": 0.0}
 
-    mode = "incremental" if all_have_fp else "cold"
-    log.info(f"Dispatching {total} targets to {jobs} workers (mode={mode})")
+    # mode determined by caller
+    # Dispatch message handled by caller in build.py
     _progress["started"] = time.monotonic()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -159,7 +159,7 @@ def dispatch(
         done = 0
         for future, target in futures:
             try:
-                future.result(timeout=1200)
+                future.result(timeout=3700)
             except Exception as e:
                 log.error(f"Worker exception for {target.src}: {e}")
                 target.status = "failed"

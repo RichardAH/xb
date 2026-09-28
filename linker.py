@@ -88,6 +88,7 @@ def _classify_libs(deps) -> tuple[list[str], list[str]]:
 def link_executable(
     graph: BuildGraph,
     cc: str = "g++",
+    raw_cc: str = None,
     cxxflags: list[str] | None = None,
     ldflags: list[str] | None = None,
     libs: list[str] | None = None,
@@ -130,8 +131,12 @@ def link_executable(
         if lib not in shared_libs and lib not in static_lib_names:
             shared_libs.append(lib)
 
-    # Build link command
-    cmd = [cc]
+    # Build link command - use raw compiler (not ccache) for linking
+    linker = raw_cc if raw_cc else cc
+    # Strip ccache prefix if present
+    if linker.startswith("/usr/bin/ccache") or "ccache" in linker.split("/"):
+        linker = raw_cc if raw_cc else "g++"
+    cmd = [linker]
     cmd.extend(cxxflags or [])
     cmd.extend(exe.ldflags)
     cmd.extend(ldflags or [])

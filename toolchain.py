@@ -12,6 +12,12 @@ import platform
 from pathlib import Path
 
 
+def _is_system_include(path: str) -> bool:
+    """Check if an include path is a third-party/system path (not project source)."""
+    path_lower = path.lower()
+    return "conan" in path_lower or path_lower.endswith("external") or "external/" in path_lower
+
+
 class Toolchain:
     """Compiler toolchain with common flags."""
 
@@ -77,6 +83,12 @@ class Toolchain:
             "-Wno-unused-local-typedefs",
             "-Wno-maybe-uninitialized",
             "-fno-strict-aliasing",
+        ])
+
+        # Boost 1.86 compatibility with C++20
+        self._cflags.extend([
+            "-DBOOST_ASIO_DISABLE_STD_EXPERIMENTAL_COROUTINES",
+            "-DBOOST_BIND_GLOBAL_PLACEHOLDERS",
         ])
 
         # C++ specific
@@ -182,10 +194,20 @@ class Toolchain:
 
     @property
     def include_flags(self) -> list[str]:
-        """Convert include_roots to -I flags."""
+        """
+        Convert include_roots to -I flags for project headers and
+        -isystem flags for third-party headers.
+        
+        -isystem reduces warning noise and can speed up include resolution
+        for heavily-used third-party headers like boost.
+        """
         flags = []
         for d in self.include_roots:
-            if os.path.isdir(d):
+            if not os.path.isdir(d):
+                continue
+            if _is_system_include(d):
+                flags.extend(["-isystem", d])
+            else:
                 flags.extend(["-I", d])
         return flags
 
@@ -236,3 +258,4 @@ class Toolchain:
     def archive_path(self, mod_name: str) -> str:
         """Compute the output .a path for a module."""
         return os.path.join(self.build_root, f"lib{mod_name.replace('.', '_')}.a")
+
